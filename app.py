@@ -4,7 +4,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 import plotly.graph_objects as go
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import yfinance as yf
 
 # ==============================
@@ -34,40 +34,34 @@ backtest_days = st.sidebar.slider("回測天數", 30, 365, 90)
 symbol = "XAU" if "黃金" in asset else "XAG"
 
 # ==============================
-# 3️⃣ Gold‑API 即時價格抓取（穩定版）
+# 3️⃣ Gold‑API 即時價格抓取（兼容版）
 # ==============================
-API_KEY = "goldapi-quickstart-XXXX"  # Quickstart Key
+API_KEY = "goldapi-quickstart-XXXX"  # 請改成你正式的 Gold-API Key
 url = f"https://www.goldapi.io/api/{symbol}/USD"
 headers = {"x-access-token": API_KEY, "Content-Type": "application/json"}
+
+curr_price = None
+timestamp = datetime.now().isoformat()
 
 try:
     response = requests.get(url, headers=headers, timeout=10)
     data = response.json()
     
-    if "price" not in data or data["price"] is None:
-        st.error(f"即時價格抓取失敗，請稍後再試。API 回傳內容: {data}")
-        st.stop()
-    
-    curr_price = float(data["price"])
-    timestamp = data.get("timestamp", datetime.now().isoformat())
+    # 檢查是否有 price
+    if "price" in data and data["price"] is not None:
+        curr_price = float(data["price"])
+        timestamp = data.get("timestamp", timestamp)
+    else:
+        st.warning(f"Gold-API 即時資料不可用，使用歷史資料最後價格作為 fallback。\nAPI 回傳: {data}")
 
 except requests.exceptions.RequestException as e:
-    st.error(f"API 請求失敗: {e}")
-    st.stop()
-except ValueError:
-    st.error(f"價格資料格式錯誤: {data}")
-    st.stop()
-
-st.subheader(f"📈 {asset} 即時價格")
-st.metric("即時價格 (USD)", f"${curr_price:,.2f}", delta=None)
-st.caption(f"資料時間: {timestamp}")
+    st.warning(f"Gold-API 請求失敗，使用歷史資料最後價格 fallback。\n錯誤: {e}")
 
 # ==============================
 # 4️⃣ 歷史資料抓取 (yfinance)
 # ==============================
 ticker = "GC=F" if symbol=="XAU" else "SI=F"
 hist = yf.download(ticker, period="5y", interval="1d")['Close'].ffill()
-
 df = pd.DataFrame()
 df['price'] = hist
 df['ma20'] = df['price'].rolling(20).mean()
@@ -80,6 +74,15 @@ rs = gain / loss.replace(0, np.nan)
 df['rsi'] = 100 - (100 / (1 + rs))
 df['target'] = df['price'].shift(-1)
 df = df.dropna()
+
+# 如果 Gold-API 無法抓到，即時價格 fallback
+if curr_price is None:
+    curr_price = df['price'].iloc[-1]
+    st.info(f"⚠️ 即時價格不可用，使用歷史資料最後價格作為即時價格：${curr_price:,.2f}")
+
+st.subheader(f"📈 {asset} 即時價格")
+st.metric("即時價格 (USD)", f"${curr_price:,.2f}", delta=None)
+st.caption(f"資料時間: {timestamp}")
 
 # ==============================
 # 5️⃣ AI 模型預測
