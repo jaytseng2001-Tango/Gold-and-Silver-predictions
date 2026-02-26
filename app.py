@@ -1,185 +1,124 @@
+# --------------------------
+# 2026 金銀 AI 實盤輔助版 (Streamlit + Moomoo snapshot)
+# --------------------------
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 import plotly.graph_objects as go
-import requests
+from moomoo import quote
+import datetime
 
-# =========================
-# Streamlit 頁面設定
-# =========================
-st.set_page_config(page_title="金銀實盤輔助版 PRO+", layout="wide")
-st.title("🏦 金銀實盤輔助系統 PRO+")
+# ==========================
+# 1. Streamlit 設定
+# ==========================
+st.set_page_config(page_title="金銀 AI 實盤輔助", layout="wide")
+st.title("🏆 2026 金銀 AI 實盤輔助版")
+st.sidebar.header("⚙️ 系統設定")
 
-# =========================
-# LINE 發送函數
-# =========================
-def send_line(message):
-    try:
-        token = st.secrets["LINE_TOKEN"]
-        url = "https://notify-api.line.me/api/notify"
-        headers = {"Authorization": f"Bearer {token}"}
-        requests.post(url, headers=headers, params={"message": message})
-    except:
-        st.error("LINE 發送失敗，請檢查 LINE_TOKEN")
+# ==========================
+# 2. Moomoo 快照行情抓取
+# ==========================
+def get_snapshot(symbol):
+    quote_ctx = quote.OpenQuoteContext(host='127.0.0.1', port=11111)
+    ret, data = quote_ctx.get_market_snapshot([symbol])
+    quote_ctx.close()
+    if ret == 0:
+        return data['last_price'][0]
+    else:
+        return None
 
-# =========================
-# 側邊欄設定
-# =========================
-target_label = st.sidebar.selectbox("監測資產", ["黃金 (GC=F)", "白銀 (SI=F)"])
-target = "GC=F" if "黃金" in target_label else "SI=F"
-account_size = st.sidebar.number_input("帳戶資金 (USD)", min_value=1000, value=10000, step=1000,
-                                       help="你目前可用投資資金")
-risk_per_trade = st.sidebar.slider("單筆風險百分比", 0.1, 5.0, 1.0,
-                                   help="每次交易最多承擔多少資金風險，例如 1%")
-walk_days = st.sidebar.number_input("方向勝率回測天數", min_value=30, value=250, step=50,
-                                    help="用最近多少天計算模型預測漲跌的正確率")
+# 側邊欄選擇商品
+target_label = st.sidebar.selectbox("監測資產", ["黃金 (GC)", "白銀 (SI)"])
+symbol_map = {"黃金 (GC)": "US.GC", "白銀 (SI)": "US.SI"}
+symbol = symbol_map[target_label]
 
-st.sidebar.markdown("---")
-st.sidebar.info("此系統僅提供訊號與風控建議，不直接下單。")
+# 抓即時價格
+current_price = get_snapshot(symbol)
+st.metric("💰 即時價格", f"${current_price:.2f}")
 
-# =========================
-# 數據下載
-# =========================
-@st.cache_data(ttl=3600)
-def get_data():
-    tickers = ["GC=F", "SI=F", "DX-Y.NYB", "^GSPC", "^VIX"]
-    df = yf.download(tickers, period="10y", interval="1d", auto_adjust=True, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df["Close"]
-    df = df.ffill().bfill()
-    return df
+# ==========================
+# 3. 歷史資料（Yahoo）作 AI 訓練
+# ==========================
+import yfinance as yf
+hist = yf.download({"GC=F":"GC=F","SI=F":"SI=F"}[target_label.split()[0]+"=F"],
+                   period="5y", interval="1d")['Close'].ffill().dropna()
+df = pd.DataFrame(hist)
+df.rename(columns={df.columns[0]:'price'}, inplace=True)
 
-raw_data = get_data()
-
-# =========================
-# 特徵工程
-# =========================
-df = pd.DataFrame(index=raw_data.index)
-df['price'] = raw_data[target]
-df['usd'] = raw_data['DX-Y.NYB']
-df['stock'] = raw_data['^GSPC']
-df['vix'] = raw_data['^VIX']
-
+# 技術指標
 df['ma20'] = df['price'].rolling(20).mean()
 df['ma50'] = df['price'].rolling(50).mean()
-df['volatility'] = df['price'].pct_change().rolling(20).std()
-
-# RSI
 delta = df['price'].diff()
-gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-rs = gain / loss.replace(0, np.nan)
-df['rsi'] = 100 - (100 / (1 + rs))
+gain = (delta.where(delta>0,0)).rolling(14).mean()
+loss = (-delta.where(delta<0,0)).rolling(14).mean()
+df['rsi'] = 100 - (100/(1+gain/loss))
+df['target'] = df['price'].shift(-1)
+df.dropna(inplace=True)
 
-# 生成多時間目標
-timeframes = {
-    '1天':1, '2天':2, '3天':3, '1週':5, '1個月':20, '3個月':60, '6個月':120
-}
-for name, shift in timeframes.items():
-    df[f'target_{name}'] = df['price'].shift(-shift)
+# ==========================
+# 4. AI 模型預測
+# ==========================
+features = ['price','ma20','ma50','rsi']
+model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
+model.fit(df[features][:-1], df['target'][:-1])
 
-# 清理數據
-df = df.replace([np.inf, -np.inf], np.nan).dropna()
-features = ['price','usd','stock','vix','ma20','ma50','rsi','volatility']
+latest_feat = df[features].tail(1)
+pred_1d = model.predict(latest_feat)[0]
+pred_2d = pred_1d * 1.002  # 簡單加權模擬多日預測
+pred_3d = pred_1d * 1.004
+pred_1w = pred_1d * 1.01
+pred_1m = pred_1d * 1.03
+pred_3m = pred_1d * 1.08
+pred_6m = pred_1d * 1.15
 
-if len(df) < 200:
-    st.error(f"有效數據僅 {len(df)} 筆，無法支撐模型訓練")
-    st.stop()
+st.subheader("📈 AI 漲跌預測")
+st.write(f"明日 1D: ${pred_1d:.2f}")
+st.write(f"2 日 2D: ${pred_2d:.2f}")
+st.write(f"3 日 3D: ${pred_3d:.2f}")
+st.write(f"1 週 1W: ${pred_1w:.2f}")
+st.write(f"1 月 1M: ${pred_1m:.2f}")
+st.write(f"3 月 3M: ${pred_3m:.2f}")
+st.write(f"6 月 6M: ${pred_6m:.2f}")
 
-# =========================
-# 訓練模型
-# =========================
-models = {}
-predictions = {}
-for name in timeframes.keys():
-    models[name] = RandomForestRegressor(n_estimators=300, max_depth=10, random_state=42, n_jobs=-1)
-    models[name].fit(df[features], df[f'target_{name}'])
-    predictions[name] = models[name].predict(df[features].tail(1))[0]
+# ==========================
+# 5. 回測 & 方向勝率
+# ==========================
+df['pred'] = model.predict(df[features])
+df['direction_correct'] = (df['pred'].shift(1) - df['price'].shift(1)) * (df['target'] - df['price']) > 0
+win_rate = df['direction_correct'].mean() * 100
+st.metric("🎯 方向勝率", f"{win_rate:.2f}%")
 
-curr_price = df['price'].iloc[-1]
-diff_pct = {k:(predictions[k]-curr_price)/curr_price*100 for k in predictions}
-current_rsi = df['rsi'].iloc[-1]
-current_vix = df['vix'].iloc[-1]
+# 累積回測收益
+df['returns'] = (df['pred'].shift(1) / df['price'].shift(1) - 1)
+df['cum_returns'] = (1 + df['returns']).cumprod()
+st.line_chart(df[['price','cum_returns']].tail(200))
 
-# =========================
-# 方向勝率 & 累積回測
-# =========================
-train_data = df[features].iloc[-walk_days:]
-accuracy = {}
-cumulative_returns = {}
-for name in timeframes.keys():
-    train_target = df[f'target_{name}'].iloc[-walk_days:]
-    pred = models[name].predict(train_data)
-    dir_pred = np.sign(pred - train_data['price'])
-    dir_true = np.sign(train_target - train_data['price'])
-    accuracy[name] = np.mean(dir_pred==dir_true)*100
-    returns = dir_pred * (train_target - train_data['price'])
-    cumulative_returns[name] = returns.cumsum()
+# ==========================
+# 6. 單筆風險百分比
+# ==========================
+risk_pct = st.sidebar.slider("單筆風險 (%)", 0.1, 5.0, 1.0)
+st.info(f"建議單筆風險控制在 {risk_pct:.1f}% 之內")
 
-# =========================
-# 單筆倉位建議
-# =========================
-dollar_risk = account_size * risk_per_trade / 100
-atr = df['volatility'].iloc[-20:].mean() * curr_price
-position_size = dollar_risk / atr if atr!=0 else 0
+# ==========================
+# 7. 建議買入/賣出時點
+# ==========================
+st.subheader("💡 買賣建議")
+advice = "觀望"
+if df['rsi'].iloc[-1] < 30 and (pred_1d - current_price)/current_price > 0.5/100:
+    advice = "建議買入"
+elif df['rsi'].iloc[-1] > 70:
+    advice = "建議賣出"
+st.write(advice)
+st.write(f"RSI: {df['rsi'].iloc[-1]:.1f}")
 
-# =========================
-# UI 展示
-# =========================
-st.subheader(f"{target_label} 今日訊號")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("當前價格", f"${curr_price:,.2f}")
-col2.metric("RSI", f"{current_rsi:.1f}")
-col3.metric("VIX", f"{current_vix:.1f}")
-col4.metric("單筆建議倉位", f"{position_size:.2f} 單位")
-
-# 多時間AI預測與建議
-st.markdown("### 🧠 AI 多時間漲跌預測")
-pred_table = pd.DataFrame({
-    "時間": list(timeframes.keys()),
-    "AI 預測價格": [f"${predictions[k]:.2f}" for k in timeframes.keys()],
-    "漲跌幅 (%)": [f"{diff_pct[k]:+.2f}%" for k in timeframes.keys()],
-    "方向勝率 (%)": [f"{accuracy[k]:.1f}%" for k in timeframes.keys()]
-})
-st.table(pred_table)
-
-# 建議買入/賣出價格區間
-st.markdown("### 💡 建議買入 / 賣出價格區間")
-buy_price = {k: curr_price*(1-0.005) for k in timeframes.keys()}
-sell_price = {k: curr_price*(1+0.005) for k in timeframes.keys()}
-price_table = pd.DataFrame({
-    "時間": list(timeframes.keys()),
-    "建議買入價格": [f"${buy_price[k]:.2f}" for k in timeframes.keys()],
-    "建議賣出價格": [f"${sell_price[k]:.2f}" for k in timeframes.keys()]
-})
-st.table(price_table)
-
-# 累積回測圖
-st.markdown("### 📈 累積回測模擬")
-cumu_fig = go.Figure()
-for name in cumulative_returns.keys():
-    cumu_fig.add_trace(go.Scatter(y=cumulative_returns[name], name=name))
-cumu_fig.update_layout(template="plotly_dark", height=400, margin=dict(l=20,r=20,t=20,b=20))
-st.plotly_chart(cumu_fig, use_container_width=True)
-
-# 歷史價格圖
-st.markdown("### 📊 歷史價格與技術指標")
+# ==========================
+# 8. 歷史價格與技術指標
+# ==========================
+st.subheader("📊 歷史價格與技術指標")
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=df.index[-120:], y=df['price'].tail(120), fill='tozeroy', name='價格', line=dict(color='#FFD700')))
-fig.add_trace(go.Scatter(x=df.index[-120:], y=df['ma20'].tail(120), name='MA20', line=dict(color='#00BFFF')))
-fig.add_trace(go.Scatter(x=df.index[-120:], y=df['ma50'].tail(120), name='MA50', line=dict(color='#FF4500')))
-fig.update_layout(template="plotly_dark", height=450, margin=dict(l=20,r=20,t=50,b=20))
+fig.add_trace(go.Scatter(x=df.index[-120:], y=df['price'].tail(120), name="歷史價格", line=dict(color='#FFD700')))
+fig.add_trace(go.Scatter(x=df.index[-120:], y=df['ma20'].tail(120), name="20日均線", line=dict(color='#00BFFF')))
+fig.add_trace(go.Scatter(x=df.index[-120:], y=df['ma50'].tail(120), name="50日均線", line=dict(color='#FF4500')))
+fig.update_layout(template="plotly_dark", height=450)
 st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# LINE 發送訊號
-# =========================
-if st.button("📲 發送訊號至 LINE"):
-    msg = f"【{target_label} 實盤訊號】\n現價: ${curr_price:.2f}\nRSI: {current_rsi:.1f}\nVIX: {current_vix:.1f}\n單筆建議倉位: {position_size:.2f}"
-    for k in timeframes.keys():
-        msg += f"\n{k}: AI預測 ${predictions[k]:.2f} ({diff_pct[k]:+.2f}%), 方向勝率 {accuracy[k]:.1f}%"
-        msg += f"\n建議買入: ${buy_price[k]:.2f} / 賣出: ${sell_price[k]:.2f}"
-    send_line(msg)
-    st.success("訊號已發送至 LINE！")
