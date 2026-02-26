@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import requests
 from datetime import datetime
 import yfinance as yf
+import pytz
 
 # ==============================
 # 1️⃣ Streamlit 頁面設定
@@ -14,7 +15,7 @@ st.set_page_config(page_title="Gold & Silver AI 實盤輔助", layout="wide")
 st.title("🏆 Gold & Silver AI 實盤輔助系統 (Pro+)")
 
 # ==============================
-# 2️⃣ 側邊欄：功能說明與設定
+# 2️⃣ 側邊欄設定
 # ==============================
 st.sidebar.header("⚙️ 功能設定與說明")
 st.sidebar.markdown("""
@@ -30,73 +31,76 @@ st.sidebar.markdown("""
 asset = st.sidebar.selectbox("選擇資產", ["黃金 XAU/USD", "白銀 XAG/USD"])
 risk_pct = st.sidebar.slider("單筆風險百分比", 1, 10, 2)
 backtest_days = st.sidebar.slider("回測天數", 30, 365, 90)
-
 symbol = "XAU" if "黃金" in asset else "XAG"
+ticker = "GC=F" if symbol=="XAU" else "SI=F"
 
 # ==============================
-# 3️⃣ Gold‑API 即時價格抓取（兼容版）
+# 3️⃣ Gold-API 即時價格抓取 (兼容版)
 # ==============================
-API_KEY = "goldapi-quickstart-XXXX"  # 請改成你正式的 Gold-API Key
+API_KEY = "goldapi-quickstart-XXXX"  # 替換成你的正式 Key
 url = f"https://www.goldapi.io/api/{symbol}/USD"
 headers = {"x-access-token": API_KEY, "Content-Type": "application/json"}
 
 curr_price = None
-timestamp = datetime.now().isoformat()
+mel_tz = pytz.timezone("Australia/Melbourne")
+mel_time_str = datetime.now(mel_tz).strftime("%Y-%m-%d %H:%M:%S")
 
 try:
     response = requests.get(url, headers=headers, timeout=10)
     data = response.json()
-    
-    # 檢查是否有 price
     if "price" in data and data["price"] is not None:
         curr_price = float(data["price"])
-        timestamp = data.get("timestamp", timestamp)
+        api_timestamp = data.get("timestamp", None)
+        if api_timestamp:
+            utc_time = datetime.fromisoformat(api_timestamp.replace("Z","+00:00"))
+            mel_time = utc_time.astimezone(mel_tz)
+            mel_time_str = mel_time.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            mel_time_str = datetime.now(mel_tz).strftime("%Y-%m-%d %H:%M:%S")
     else:
-        st.warning(f"Gold-API 即時資料不可用，使用歷史資料最後價格作為 fallback。\nAPI 回傳: {data}")
+        st.warning(f"Gold-API 即時資料不可用，使用歷史資料 fallback。\nAPI 回傳: {data}")
 
-except requests.exceptions.RequestException as e:
-    st.warning(f"Gold-API 請求失敗，使用歷史資料最後價格 fallback。\n錯誤: {e}")
+except Exception as e:
+    st.warning(f"Gold-API 請求失敗，使用歷史資料 fallback。錯誤: {e}")
 
 # ==============================
-# 4️⃣ 歷史資料抓取 (yfinance)
+# 4️⃣ 歷史資料抓取
 # ==============================
-ticker = "GC=F" if symbol=="XAU" else "SI=F"
 hist = yf.download(ticker, period="5y", interval="1d")['Close'].ffill()
 df = pd.DataFrame()
 df['price'] = hist
 df['ma20'] = df['price'].rolling(20).mean()
 df['ma50'] = df['price'].rolling(50).mean()
-
 delta = df['price'].diff()
 gain = (delta.where(delta>0,0)).rolling(14).mean()
 loss = (-delta.where(delta<0,0)).rolling(14).mean()
-rs = gain / loss.replace(0, np.nan)
+rs = gain / loss.replace(0,np.nan)
 df['rsi'] = 100 - (100 / (1 + rs))
 df['target'] = df['price'].shift(-1)
 df = df.dropna()
 
-# 如果 Gold-API 無法抓到，即時價格 fallback
+# fallback
 if curr_price is None:
     curr_price = df['price'].iloc[-1]
-    st.info(f"⚠️ 即時價格不可用，使用歷史資料最後價格作為即時價格：${curr_price:,.2f}")
+    mel_time_str = datetime.now(mel_tz).strftime("%Y-%m-%d %H:%M:%S")
+    st.info(f"⚠️ 即時價格不可用，使用歷史最後價格：${curr_price:,.2f}")
 
 st.subheader(f"📈 {asset} 即時價格")
-st.metric("即時價格 (USD)", f"${curr_price:,.2f}", delta=None)
-st.caption(f"資料時間: {timestamp}")
+st.metric("即時價格 (USD)", f"${curr_price:,.2f}")
+st.caption(f"資料抓取時間（墨爾本）: {mel_time_str}")
 
 # ==============================
-# 5️⃣ AI 模型預測
+# 5️⃣ AI 預測
 # ==============================
 features = ['price','ma20','ma50','rsi']
 train_size = int(len(df)*0.8)
 train = df[:train_size]
-model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
+model = RandomForestRegressor(n_estimators=300, max_depth=10, random_state=42)
 model.fit(train[features], train['target'])
 
 latest = df[features].tail(1)
 pred_next = model.predict(latest)[0]
 diff_pct = (pred_next - curr_price)/curr_price*100
-
 st.subheader("🤖 AI 預測")
 st.metric("明日價格預測", f"${pred_next:,.2f}", f"{diff_pct:+.2f}%")
 
@@ -106,7 +110,6 @@ st.metric("明日價格預測", f"${pred_next:,.2f}", f"{diff_pct:+.2f}%")
 df['pred'] = model.predict(df[features])
 df['correct'] = np.sign(df['pred'].diff()) == np.sign(df['target'].diff())
 win_rate = df['correct'].tail(backtest_days).mean() * 100
-
 st.subheader("📊 回測與方向勝率")
 st.metric(f"{backtest_days} 日方向勝率", f"{win_rate:.2f}%")
 
