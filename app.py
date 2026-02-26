@@ -5,12 +5,13 @@ from sklearn.ensemble import RandomForestRegressor
 import plotly.graph_objects as go
 import requests
 from datetime import datetime, timedelta
+import yfinance as yf
 
 # ==============================
-# 1️⃣ 設定頁面
+# 1️⃣ Streamlit 頁面設定
 # ==============================
-st.set_page_config(page_title="Gold-Silver AI 實盤輔助", layout="wide")
-st.title("🏆 Gold & Silver AI 實盤輔助系統")
+st.set_page_config(page_title="Gold & Silver AI 實盤輔助", layout="wide")
+st.title("🏆 Gold & Silver AI 實盤輔助系統 (Pro+)")
 
 # ==============================
 # 2️⃣ 側邊欄：功能說明與設定
@@ -33,7 +34,7 @@ backtest_days = st.sidebar.slider("回測天數", 30, 365, 90)
 symbol = "XAU" if "黃金" in asset else "XAG"
 
 # ==============================
-# 3️⃣ Gold‑API 即時價格抓取
+# 3️⃣ Gold‑API 即時價格抓取（穩定版）
 # ==============================
 API_KEY = "goldapi-quickstart-XXXX"  # Quickstart Key
 url = f"https://www.goldapi.io/api/{symbol}/USD"
@@ -42,20 +43,28 @@ headers = {"x-access-token": API_KEY, "Content-Type": "application/json"}
 try:
     response = requests.get(url, headers=headers, timeout=10)
     data = response.json()
-    curr_price = data.get('price', None)
-    timestamp = data.get('timestamp', datetime.now().isoformat())
-except Exception as e:
-    st.error("即時資料抓取失敗，請稍後再試")
+    
+    if "price" not in data or data["price"] is None:
+        st.error(f"即時價格抓取失敗，請稍後再試。API 回傳內容: {data}")
+        st.stop()
+    
+    curr_price = float(data["price"])
+    timestamp = data.get("timestamp", datetime.now().isoformat())
+
+except requests.exceptions.RequestException as e:
+    st.error(f"API 請求失敗: {e}")
+    st.stop()
+except ValueError:
+    st.error(f"價格資料格式錯誤: {data}")
     st.stop()
 
 st.subheader(f"📈 {asset} 即時價格")
 st.metric("即時價格 (USD)", f"${curr_price:,.2f}", delta=None)
+st.caption(f"資料時間: {timestamp}")
 
 # ==============================
-# 4️⃣ 取得歷史資料 (yfinance)
+# 4️⃣ 歷史資料抓取 (yfinance)
 # ==============================
-import yfinance as yf
-
 ticker = "GC=F" if symbol=="XAU" else "SI=F"
 hist = yf.download(ticker, period="5y", interval="1d")['Close'].ffill()
 
@@ -63,6 +72,7 @@ df = pd.DataFrame()
 df['price'] = hist
 df['ma20'] = df['price'].rolling(20).mean()
 df['ma50'] = df['price'].rolling(50).mean()
+
 delta = df['price'].diff()
 gain = (delta.where(delta>0,0)).rolling(14).mean()
 loss = (-delta.where(delta<0,0)).rolling(14).mean()
@@ -116,9 +126,7 @@ future_days = [1,2,7,30,90,180]
 pred_prices = []
 
 for d in future_days:
-    # 假設用單步預測作為簡單模擬
     last_feat = df[features].iloc[-1:].copy()
-    pred_list = []
     price_sim = last_feat['price'].values[0]
     for i in range(d):
         last_feat['price'] = price_sim
@@ -127,7 +135,7 @@ for d in future_days:
 
 suggestion = []
 for i, d in enumerate(future_days):
-    buy_sell = "買入" if pred_prices[i] > curr_price else "賣出"
-    suggestion.append(f"未來 {d} 天 → 預測 {buy_sell}，價格: ${pred_prices[i]:,.2f}")
+    action = "買入" if pred_prices[i] > curr_price else "賣出"
+    suggestion.append(f"未來 {d} 天 → 預測 {action}，價格: ${pred_prices[i]:,.2f}")
 
 st.write("\n".join(suggestion))
